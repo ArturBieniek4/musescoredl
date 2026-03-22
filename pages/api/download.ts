@@ -11,6 +11,7 @@ type CloudscraperRequestOptions = {
 type CloudscraperResponse<TBody> = {
   statusCode: number;
   body: TBody;
+  headers?: Record<string, string | string[] | undefined>;
 };
 
 type CloudscraperError = Error & {
@@ -29,6 +30,7 @@ type EmbeddedScorePlayerState = {
   store?: {
     jmuse_settings?: {
       score_player?: {
+        isHasSVG?: boolean;
         urls?: {
           image_path?: string;
         };
@@ -48,6 +50,7 @@ type EmbeddedScorePlayerState = {
 
 type ExtractedScoreData = {
   imageUrls: string[];
+  isHasSVG?: boolean;
   releaseVer?: string;
   scoreId?: number;
   unifiedId?: string;
@@ -66,6 +69,8 @@ const { load } = require("cheerio") as {
 const { PDFDocument } = require("pdf-lib") as {
   PDFDocument: typeof import("pdf-lib").PDFDocument;
 };
+
+const sharp = require("sharp") as typeof import("sharp");
 
 /** Headers that mimic a real browser to bypass basic Cloudflare protection. */
 const BROWSER_HEADERS: Record<string, string> = {
@@ -189,6 +194,7 @@ async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> 
       const imagePath = imageUrls?.image_path;
       const revised = scorePlayer?.dates?.revised;
       const scoreId = scorePlayer?.id;
+      const isHasSVG = scorePlayerSettings?.isHasSVG;
       const releaseVer = parsedStore.config?.releaseVer;
       const unifiedId = parsedStore.config?.unified_id;
 
@@ -197,6 +203,7 @@ async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> 
         imagePath,
         revised,
         scoreId,
+        isHasSVG,
         releaseVer,
         unifiedId,
       });
@@ -207,8 +214,9 @@ async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> 
         typeof imagePath === "string" &&
         imagePath.length > 0
       ) {
+        const extension = isHasSVG ? "svg" : "png";
         const staticImageUrls = Array.from({ length: pageCount }, (_, index) => {
-          const pageUrl = `${imagePath}score_${index}.png`;
+          const pageUrl = `${imagePath}score_${index}.${extension}`;
           return typeof revised === "number"
             ? `${pageUrl}?no-cache=${revised}`
             : pageUrl;
@@ -232,6 +240,7 @@ async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> 
 
           return {
             imageUrls: resolvedImageUrls,
+            isHasSVG,
             releaseVer,
             scoreId,
             unifiedId,
@@ -240,6 +249,7 @@ async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> 
 
         return {
           imageUrls: staticImageUrls,
+          isHasSVG,
           releaseVer,
           scoreId,
           unifiedId,
@@ -306,7 +316,22 @@ async function downloadImage(url: string): Promise<Uint8Array> {
   if (res.statusCode < 200 || res.statusCode >= 300) {
     throw new Error(`Failed to download image ${url}: HTTP ${res.statusCode}`);
   }
-  return new Uint8Array(res.body);
+
+  const contentTypeHeader = res.headers?.["content-type"];
+  const contentType = Array.isArray(contentTypeHeader)
+    ? contentTypeHeader[0] ?? ""
+    : contentTypeHeader ?? "";
+  const bodyBuffer = Buffer.from(res.body);
+  const isSvg =
+    /image\/svg\+xml/i.test(contentType) ||
+    bodyBuffer.subarray(0, 512).toString("utf8").includes("<svg");
+
+  if (isSvg) {
+    const pngBuffer = await sharp(bodyBuffer).png().toBuffer();
+    return new Uint8Array(pngBuffer);
+  }
+
+  return new Uint8Array(bodyBuffer);
 }
 
 /** Build a PDF from an array of PNG and JPEG image byte arrays. */
