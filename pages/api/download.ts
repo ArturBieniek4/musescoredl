@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { load } from "cheerio";
 import { PDFDocument } from "pdf-lib";
+import cloudscraper from "cloudscraper";
 
 /** Headers that mimic a real browser to bypass basic Cloudflare protection. */
 const BROWSER_HEADERS: Record<string, string> = {
@@ -25,10 +26,37 @@ async function fetchWithRetry(
   opts: RequestInit,
   retries = 2,
   delayMs = 1000
-): Promise<Response> {
+): Promise<{
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+  arrayBuffer: () => Promise<ArrayBuffer>;
+}> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, opts);
+      const response = await cloudscraper({
+        url,
+        method: opts.method ?? "GET",
+        headers: opts.headers as Record<string, string> | undefined,
+        encoding: null,
+        simple: false,
+        resolveWithFullResponse: true,
+      });
+
+      const bodyBuffer = Buffer.isBuffer(response.body)
+        ? response.body
+        : Buffer.from(String(response.body));
+      const status = response.statusCode ?? 0;
+      const res = {
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => bodyBuffer.toString("utf-8"),
+        arrayBuffer: async () =>
+          bodyBuffer.buffer.slice(
+            bodyBuffer.byteOffset,
+            bodyBuffer.byteOffset + bodyBuffer.byteLength
+          ) as ArrayBuffer,
+      };
       if (res.ok || attempt === retries) return res;
     } catch (err) {
       if (attempt === retries) throw err;
