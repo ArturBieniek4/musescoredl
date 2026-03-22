@@ -2,6 +2,33 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { load } from "cheerio";
 import { PDFDocument } from "pdf-lib";
 
+type CloudscraperRequestOptions = {
+  uri: string;
+  headers?: Record<string, string>;
+  encoding?: null;
+  resolveWithFullResponse?: boolean;
+  simple?: boolean;
+};
+
+type CloudscraperResponse<TBody> = {
+  statusCode: number;
+  body: TBody;
+};
+
+type CloudscraperError = Error & {
+  statusCode?: number;
+  response?: {
+    statusCode?: number;
+    body?: unknown;
+  };
+};
+
+const cloudscraper = require("cloudscraper") as {
+  get<TBody = string>(
+    options: CloudscraperRequestOptions
+  ): Promise<CloudscraperResponse<TBody>>;
+};
+
 /** Headers that mimic a real browser to bypass basic Cloudflare protection. */
 const BROWSER_HEADERS: Record<string, string> = {
   "User-Agent":
@@ -19,23 +46,30 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Upgrade-Insecure-Requests": "1",
 };
 
-/** Fetch a URL with retries. */
-async function fetchWithRetry(
+/** Fetch a URL with retries through cloudscraper. */
+async function requestWithRetry<TBody = string>(
   url: string,
-  opts: RequestInit,
+  opts: Omit<CloudscraperRequestOptions, "uri">,
   retries = 2,
   delayMs = 1000
-): Promise<Response> {
+): Promise<CloudscraperResponse<TBody>> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, opts);
-      if (res.ok || attempt === retries) return res;
+      const res = await cloudscraper.get<TBody>({
+        uri: url,
+        resolveWithFullResponse: true,
+        simple: false,
+        ...opts,
+      });
+      if ((res.statusCode >= 200 && res.statusCode < 300) || attempt === retries) {
+        return res;
+      }
     } catch (err) {
-      if (attempt === retries) throw err;
+      if (attempt === retries) throw err as CloudscraperError;
     }
     await new Promise((r) => setTimeout(r, delayMs));
   }
-  throw new Error("fetchWithRetry exhausted");
+  throw new Error("requestWithRetry exhausted");
 }
 
 /** Extract score image URLs from a MuseScore page's HTML. */
@@ -71,22 +105,22 @@ function extractScoreImageUrls(html: string): string[] {
 
 /** Download an image and return its bytes. */
 async function downloadImage(url: string): Promise<Uint8Array> {
-  const res = await fetchWithRetry(
+  const res = await requestWithRetry<Buffer>(
     url,
     {
       headers: {
         ...BROWSER_HEADERS,
         Referer: "https://musescore.com/",
       },
+      encoding: null,
     },
     2,
     500
   );
-  if (!res.ok) {
-    throw new Error(`Failed to download image ${url}: HTTP ${res.status}`);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`Failed to download image ${url}: HTTP ${res.statusCode}`);
   }
-  const buffer = await res.arrayBuffer();
-  return new Uint8Array(buffer);
+  return new Uint8Array(res.body);
 }
 
 /** Build a PDF from an array of PNG and JPEG image byte arrays. */
@@ -159,15 +193,15 @@ export default async function handler(
   // ------------------------------------------------------------------
   let html: string;
   try {
-    const pageRes = await fetchWithRetry(
+    const pageRes = await requestWithRetry<string>(
       url,
       { headers: BROWSER_HEADERS },
       2,
       1500
     );
 
-    if (!pageRes.ok) {
-      if (pageRes.status === 403 || pageRes.status === 503) {
+    if (pageRes.statusCode < 200 || pageRes.statusCode >= 300) {
+      if (pageRes.statusCode === 403 || pageRes.statusCode === 503) {
         res.status(502).json({
           error:
             "MuseScore returned a Cloudflare challenge page. The score could not be fetched at this time. Please try again in a few seconds.",
@@ -175,12 +209,12 @@ export default async function handler(
         return;
       }
       res.status(502).json({
-        error: `MuseScore returned HTTP ${pageRes.status}. Please check the URL and try again.`,
+        error: `MuseScore returned HTTP ${pageRes.statusCode}. Please check the URL and try again.`,
       });
       return;
     }
 
-    html = await pageRes.text();
+    html = pageRes.body;
   } catch (err) {
     console.error("Error fetching MuseScore page:", err);
     res.status(502).json({
