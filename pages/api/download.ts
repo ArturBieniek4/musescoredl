@@ -1,6 +1,4 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { load } from "cheerio";
-import { PDFDocument } from "pdf-lib";
 
 type CloudscraperRequestOptions = {
   uri: string;
@@ -23,10 +21,50 @@ type CloudscraperError = Error & {
   };
 };
 
+type EmbeddedScorePlayerState = {
+  config?: {
+    releaseVer?: string;
+    unified_id?: string;
+  };
+  store?: {
+    jmuse_settings?: {
+      score_player?: {
+        urls?: {
+          image_path?: string;
+        };
+        json?: {
+          id?: number;
+          dates?: {
+            revised?: number;
+          };
+          metadata?: {
+            pages?: number;
+          };
+        };
+      };
+    };
+  };
+};
+
+type ExtractedScoreData = {
+  imageUrls: string[];
+  releaseVer?: string;
+  scoreId?: number;
+  unifiedId?: string;
+};
+
 const cloudscraper = require("cloudscraper") as {
   get<TBody = string>(
     options: CloudscraperRequestOptions
   ): Promise<CloudscraperResponse<TBody>>;
+};
+
+const { load } = require("cheerio") as {
+  load: typeof import("cheerio").load;
+};
+
+const { PDFDocument } = require("pdf-lib") as {
+  PDFDocument: typeof import("pdf-lib").PDFDocument;
 };
 
 /** Headers that mimic a real browser to bypass basic Cloudflare protection. */
@@ -73,8 +111,145 @@ async function requestWithRetry<TBody = string>(
 }
 
 /** Extract score image URLs from a MuseScore page's HTML. */
-function extractScoreImageUrls(html: string): string[] {
+async function resolveSecureImageUrl(
+  scoreId: number,
+  pageIndex: number,
+  releaseVer: string,
+  unifiedId: string
+): Promise<string> {
+  const authHeader = require("crypto")
+    .createHash("md5")
+    .update(`${scoreId}img${pageIndex}llfr`)
+    .digest("hex")
+    .slice(0, 4);
+
+  const res = await requestWithRetry<string>(
+    `https://musescore.com/api/jmuse?id=${scoreId}&type=img&index=${pageIndex}`,
+    {
+      headers: {
+        Authorization: authHeader,
+        "X-MU-FRONTEND-VER": releaseVer,
+        "X-Mu-Unified-Id": unifiedId,
+        Referer: "https://musescore.com/",
+      },
+    },
+    2,
+    500
+  );
+
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`Failed to resolve secure image URL: HTTP ${res.statusCode}`);
+  }
+
+  const payload = JSON.parse(res.body) as {
+    info?: {
+      url?: unknown;
+    };
+  };
+
+  if (typeof payload.info?.url !== "string" || payload.info.url.length === 0) {
+    throw new Error("Secure image response did not include a page URL");
+  }
+
+  return payload.info.url;
+}
+
+async function extractScoreImageUrls(html: string): Promise<ExtractedScoreData> {
   const $ = load(html);
+  const dataAttributes = $("*")
+    .toArray()
+    .flatMap((el) => {
+      if (!("attribs" in el) || !el.attribs) {
+        return [];
+      }
+
+      return Object.entries(el.attribs);
+    });
+  const embeddedStore = dataAttributes
+    .find(
+      ([attrName, attrValue]) =>
+        attrName.startsWith("data-") &&
+        attrValue.includes("jmuse_settings") &&
+        attrValue.includes("score_player")
+    )?.[1];
+
+  console.log("[download] extractScoreImageUrls", {
+    totalAttributes: dataAttributes.length,
+    foundEmbeddedStore: Boolean(embeddedStore),
+  });
+
+  if (embeddedStore) {
+    try {
+      const decodedStore = $("<textarea>").html(embeddedStore).text();
+      const parsedStore = JSON.parse(decodedStore) as EmbeddedScorePlayerState;
+      const scorePlayerSettings = parsedStore.store?.jmuse_settings?.score_player;
+      const scorePlayer = scorePlayerSettings?.json;
+      const imageUrls = scorePlayerSettings?.urls;
+      const pageCount = scorePlayer?.metadata?.pages;
+      const imagePath = imageUrls?.image_path;
+      const revised = scorePlayer?.dates?.revised;
+      const scoreId = scorePlayer?.id;
+      const releaseVer = parsedStore.config?.releaseVer;
+      const unifiedId = parsedStore.config?.unified_id;
+
+      console.log("[download] embedded store values", {
+        pageCount,
+        imagePath,
+        revised,
+        scoreId,
+        releaseVer,
+        unifiedId,
+      });
+
+      if (
+        typeof pageCount === "number" &&
+        pageCount > 0 &&
+        typeof imagePath === "string" &&
+        imagePath.length > 0
+      ) {
+        const staticImageUrls = Array.from({ length: pageCount }, (_, index) => {
+          const pageUrl = `${imagePath}score_${index}.png`;
+          return typeof revised === "number"
+            ? `${pageUrl}?no-cache=${revised}`
+            : pageUrl;
+        });
+
+        if (
+          typeof scoreId === "number" &&
+          typeof releaseVer === "string" &&
+          releaseVer.length > 0 &&
+          typeof unifiedId === "string" &&
+          unifiedId.length > 0 &&
+          pageCount > 1
+        ) {
+          const resolvedImageUrls = [staticImageUrls[0]];
+
+          for (let index = 1; index < staticImageUrls.length; index++) {
+            resolvedImageUrls.push(
+              await resolveSecureImageUrl(scoreId, index, releaseVer, unifiedId)
+            );
+          }
+
+          return {
+            imageUrls: resolvedImageUrls,
+            releaseVer,
+            scoreId,
+            unifiedId,
+          };
+        }
+
+        return {
+          imageUrls: staticImageUrls,
+          releaseVer,
+          scoreId,
+          unifiedId,
+        };
+      }
+      console.log("[download] embedded store missing image data");
+    } catch (error) {
+      console.error("[download] embedded store parse failed", error);
+    }
+  }
 
   const urls: string[] = [];
 
@@ -96,11 +271,22 @@ function extractScoreImageUrls(html: string): string[] {
 
   // Deduplicate while preserving order
   const seen = new Set<string>();
-  return urls.filter((u) => {
+  const dedupedUrls = urls.filter((u) => {
     if (seen.has(u)) return false;
     seen.add(u);
     return true;
   });
+
+  console.log("[download] fallback extraction", {
+    titleImageCount: $('img[title$="music notes"]').length,
+    allImageCount: $("img[src]").length,
+    extractedCount: dedupedUrls.length,
+    sampleUrls: dedupedUrls.slice(0, 3),
+  });
+
+  return {
+    imageUrls: dedupedUrls,
+  };
 }
 
 /** Download an image and return its bytes. */
@@ -215,6 +401,11 @@ export default async function handler(
     }
 
     html = pageRes.body;
+    console.log("[download] fetched MuseScore page", {
+      url,
+      statusCode: pageRes.statusCode,
+      htmlLength: html.length,
+    });
   } catch (err) {
     console.error("Error fetching MuseScore page:", err);
     res.status(502).json({
@@ -226,7 +417,13 @@ export default async function handler(
   // ------------------------------------------------------------------
   // 2. Extract score image URLs
   // ------------------------------------------------------------------
-  const imageUrls = extractScoreImageUrls(html);
+  const extraction = await extractScoreImageUrls(html);
+  const imageUrls = extraction.imageUrls;
+  console.log("[download] extracted image URLs", {
+    count: imageUrls.length,
+    sampleUrls: imageUrls.slice(0, 5),
+    scoreId: extraction.scoreId,
+  });
 
   if (imageUrls.length === 0) {
     res.status(404).json({
