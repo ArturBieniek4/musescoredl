@@ -19,6 +19,8 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Upgrade-Insecure-Requests": "1",
 };
 
+const CLOUDFLARE_BLOCK_STATUS = new Set([403, 503]);
+
 /** Fetch a URL with retries. */
 async function fetchWithRetry(
   url: string,
@@ -67,6 +69,123 @@ function extractScoreImageUrls(html: string): string[] {
     seen.add(u);
     return true;
   });
+}
+
+/** Detect if a returned HTML page is a Cloudflare challenge page. */
+export function isCloudflareChallengePage(html: string): boolean {
+  const normalized = html.toLowerCase();
+  return (
+    normalized.includes("cf_chl") ||
+    normalized.includes("challenge-platform") ||
+    normalized.includes("cf-browser-verification") ||
+    normalized.includes("checking your browser") ||
+    normalized.includes("just a moment") ||
+    normalized.includes("cf_clearance") ||
+    normalized.includes("__cf_bm")
+  );
+}
+
+function updateCookieJarFromResponse(
+  response: Response,
+  cookieJar: Map<string, string>
+) {
+  const responseHeaders = response.headers as Headers & {
+    getSetCookie?: () => string[];
+    raw?: () => Record<string, string[]>;
+  };
+
+  let setCookieHeaders: string[] = [];
+  if (typeof responseHeaders.getSetCookie === "function") {
+    setCookieHeaders = responseHeaders.getSetCookie();
+  } else if (typeof responseHeaders.raw === "function") {
+    setCookieHeaders = responseHeaders.raw()["set-cookie"] ?? [];
+  } else {
+    const singleSetCookie = response.headers.get("set-cookie");
+    if (singleSetCookie) setCookieHeaders = [singleSetCookie];
+  }
+
+  for (const setCookie of setCookieHeaders) {
+    const cookiePair = setCookie.split(";", 1)[0];
+    const separatorIndex = cookiePair.indexOf("=");
+    if (separatorIndex <= 0) continue;
+    const name = cookiePair.slice(0, separatorIndex).trim();
+    const value = cookiePair.slice(separatorIndex + 1).trim();
+    if (!name) continue;
+    cookieJar.set(name, value);
+  }
+}
+
+function getCookieHeader(cookieJar: Map<string, string>): string {
+  return Array.from(cookieJar.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+}
+
+async function fetchMuseScoreHtml(url: string): Promise<{
+  ok: boolean;
+  status?: number;
+  html?: string;
+  blockedByCloudflare: boolean;
+}> {
+  const cookieJar = new Map<string, string>();
+  const maxAttempts = 4;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const cookieHeader = getCookieHeader(cookieJar);
+    const requestHeaders: Record<string, string> = {
+      ...BROWSER_HEADERS,
+      Referer: "https://musescore.com/",
+    };
+    if (cookieHeader) requestHeaders.Cookie = cookieHeader;
+
+    if (attempt === 0) {
+      try {
+        const warmupRes = await fetch("https://musescore.com/", {
+          headers: requestHeaders,
+        });
+        updateCookieJarFromResponse(warmupRes, cookieJar);
+      } catch {
+        // best effort warm-up request
+      }
+    }
+
+    let pageRes: Response;
+    try {
+      pageRes = await fetch(url, { headers: requestHeaders });
+    } catch {
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      throw new Error("Failed to fetch MuseScore page");
+    }
+    updateCookieJarFromResponse(pageRes, cookieJar);
+
+    if (!pageRes.ok) {
+      if (CLOUDFLARE_BLOCK_STATUS.has(pageRes.status) && attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      return {
+        ok: false,
+        status: pageRes.status,
+        blockedByCloudflare: CLOUDFLARE_BLOCK_STATUS.has(pageRes.status),
+      };
+    }
+
+    const html = await pageRes.text();
+    if (isCloudflareChallengePage(html)) {
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      return { ok: false, blockedByCloudflare: true };
+    }
+
+    return { ok: true, html, blockedByCloudflare: false };
+  }
+
+  return { ok: false, blockedByCloudflare: true };
 }
 
 /** Download an image and return its bytes. */
@@ -159,28 +278,23 @@ export default async function handler(
   // ------------------------------------------------------------------
   let html: string;
   try {
-    const pageRes = await fetchWithRetry(
-      url,
-      { headers: BROWSER_HEADERS },
-      2,
-      1500
-    );
+    const pageResult = await fetchMuseScoreHtml(url);
 
-    if (!pageRes.ok) {
-      if (pageRes.status === 403 || pageRes.status === 503) {
+    if (!pageResult.ok) {
+      if (pageResult.blockedByCloudflare) {
         res.status(502).json({
           error:
-            "MuseScore returned a Cloudflare challenge page. The score could not be fetched at this time. Please try again in a few seconds.",
+            "MuseScore returned a Cloudflare challenge page that could not be resolved automatically. Please try again in a few seconds.",
         });
         return;
       }
       res.status(502).json({
-        error: `MuseScore returned HTTP ${pageRes.status}. Please check the URL and try again.`,
+        error: `MuseScore returned HTTP ${pageResult.status}. Please check the URL and try again.`,
       });
       return;
     }
 
-    html = await pageRes.text();
+    html = pageResult.html ?? "";
   } catch (err) {
     console.error("Error fetching MuseScore page:", err);
     res.status(502).json({
